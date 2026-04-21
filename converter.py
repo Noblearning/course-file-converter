@@ -12,7 +12,7 @@ normal paragraphs that follow it (until the next H4 or end of cell) → card bod
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import json, re, tempfile, webbrowser, shutil, subprocess, sys
+import json, re, tempfile, webbrowser, shutil, subprocess, sys, zipfile
 from pathlib import Path
 
 
@@ -388,44 +388,40 @@ def _collect_images(para, image_collector):
     """Find all w:drawing elements in *para* and populate *image_collector*.
 
     *image_collector* is a dict: {output_filename: bytes}
+    Each unique image is keyed by a stable filename derived from the
+    relationship ID so duplicates are naturally de-duped.
 
-    Returns a dict: {rId: (output_filename, alt_text)} for use by
-    _extract_runs.  alt_text is read from wp:docPr/@descr (Word's
-    "Alt Text" panel); falls back to empty string if absent.
+    Returns a dict: {rId: output_filename} for use by _extract_runs.
     """
-    NS_WP    = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
-    NS_BLIP  = "http://schemas.openxmlformats.org/drawingml/2006/main"
-    NS_REL   = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-    BLIP_TAG = f"{{{NS_BLIP}}}blip"
-    DOC_PR   = f"{{{NS_WP}}}docPr"
-
-    rId_to_info = {}   # rId -> (fname, alt_text)
+    rId_to_fname = {}
     try:
         part = para.part
+        NS_BLIP = "http://schemas.openxmlformats.org/drawingml/2006/main"
+        NS_REL  = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        BLIP_TAG = f"{{{NS_BLIP}}}blip"
+
         for drawing in para._p.iter(qn("w:drawing")):
-            alt_text = ""
-            for doc_pr in drawing.iter(DOC_PR):
-                alt_text = (doc_pr.get("descr") or
-                            doc_pr.get("title") or "").strip()
-                break
             for blip in drawing.iter(BLIP_TAG):
                 rId = blip.get(f"{{{NS_REL}}}embed")
-                if not rId or rId in rId_to_info:
+                if not rId or rId in rId_to_fname:
                     continue
                 try:
                     img_part = part.rels[rId].target_part
                     blob     = img_part.blob
-                    fname    = img_part.filename
+                    # Use the part's own filename; fall back to rId + extension
+                    fname = img_part.filename          # e.g. "image1.png"
+                    # Avoid collisions if two different rIds share the same
+                    # generic filename (e.g. two "image.png" from different parts)
                     if fname in image_collector and image_collector[fname] != blob:
                         ext   = Path(fname).suffix
                         fname = f"{Path(fname).stem}_{rId}{ext}"
-                    rId_to_info[rId] = (fname, alt_text)
+                    rId_to_fname[rId] = fname
                     image_collector[fname] = blob
                 except Exception:
                     pass
     except Exception:
         pass
-    return rId_to_info
+    return rId_to_fname
 
 
 
@@ -452,15 +448,12 @@ def _extract_runs(el, hyperlink_map, image_collector=None, rId_to_fname=None):
                 BLIP_TAG = f"{{{NS_BLIP}}}blip"
                 for blip in child.iter(BLIP_TAG):
                     rId = blip.get(f"{{{NS_REL}}}embed")
-                    info = rId_to_fname.get(rId) if rId else None
-                    if info:
-                        fname, alt_text = info
-                        safe_src = escape_html(fname)
-                        safe_alt = escape_html(alt_text) if alt_text else safe_src
+                    fname = rId_to_fname.get(rId) if rId else None
+                    if fname:
+                        safe = escape_html(fname)
                         parts.append(
-                            f'<img src="images/{safe_src}" alt="{safe_alt}" '
-                            f'style="max-width:100%;">'
-                        )
+                            f'<img src="images/{safe}" alt="{safe}" '
+                            f'style="max-width:100%;">')
         elif tag == "hyperlink":
             rid = child.get(qn("r:id"))
             url = hyperlink_map.get(rid, "#")
@@ -488,7 +481,7 @@ def para_to_inline_html(para, image_collector=None):
     except Exception:
         pass
 
-    # Build the rId→(filename, alt_text) map for this paragraph's images
+    # Build the rId→filename map for this paragraph's images
     rId_to_fname = None
     if image_collector is not None:
         rId_to_fname = _collect_images(para, image_collector)
@@ -576,34 +569,57 @@ def render_list(list_paras, force_tag=None, image_collector=None):
 #  ACCORDION
 # ═══════════════════════════════════════════════════════════════
 
+# Global counter so each accordion gets unique DOM ids across the document
+_acc_id_counter = 0
+
 def render_accordion(cell_paragraphs, acc_heading):
-    lines = ['<div class="accordion">']
-    in_card = False
+    """Render a D2L accordion using Brightspace's exact output HTML format.
+
+    Each card gets unique heading/collapse IDs so data-toggle works when
+    pasted into Brightspace.
+    """
+    global _acc_id_counter
+    _acc_id_counter += 1
+    acc_id = _acc_id_counter
+
+    # Collect (title_html, [body_lines]) pairs
+    cards = []
+    cur_title = None
+    cur_body  = []
     for para in cell_paragraphs:
         if style_name(para) == acc_heading:
-            if in_card:
-                lines += ['      </div>', '    </div>', '  </div>']
-            title = para_to_inline_html(para)
-            lines += [
-                '  <div class="card">',
-                '    <div class="card-header">',
-                f'      <h2 class="card-title">{title}</h2>',
-                '    </div>',
-                '    <div class="collapse">',
-                '      <div class="card-body">',
-            ]
-            in_card = True
+            if cur_title is not None:
+                cards.append((cur_title, list(cur_body)))
+            cur_title = para_to_inline_html(para)
+            cur_body  = []
         else:
             inline = para_to_inline_html(para)
             if inline.strip():
-                prefix = "        " if in_card else ""
-                lines.append(f"{prefix}<p>{inline}</p>")
-    if in_card:
+                cur_body.append(f"        <p>{inline}</p>")
+    if cur_title is not None:
+        cards.append((cur_title, list(cur_body)))
+
+    lines = [f'<div class="accordion" id="accordion_{acc_id}">']
+    for ci, (title, body_lines) in enumerate(cards):
+        card_id     = acc_id * 100 + ci
+        heading_id  = f"heading_acc_{card_id}"
+        collapse_id = f"collapse_acc_{card_id}"
+        lines += [
+            '  <div class="card">',
+            f'    <div class="card-header" id="{heading_id}">',
+            f'      <h2 class="card-title"><button class="btn btn-link" '
+            f'type="button" data-toggle="collapse" aria-expanded="false" '
+            f'data-target="#{collapse_id}" '
+            f'aria-controls="{collapse_id}">{title}</button></h2>',
+            '    </div>',
+            f'    <div class="collapse" id="{collapse_id}" '
+            f'aria-labelledby="{heading_id}">',
+            '      <div class="card-body">',
+        ]
+        lines.extend(body_lines)
         lines += ['      </div>', '    </div>', '  </div>']
     lines.append('</div>')
     return "\n".join(lines)
-
-
 def is_accordion_table(table, acc_heading):
     try:
         cells = list({id(c): c for row in table.rows for c in row.cells}.values())
@@ -695,133 +711,20 @@ def _accept_tracked_changes(doc):
             break
 
 
-# Matches a bare http/https URL and nothing else
-_URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
-
-
-def _extract_comments(doc):
-    """Return {comment_id_str: text} from the document comments part.
-    Returns {} when no comments part exists.
-    """
-    comment_map = {}
-    try:
-        cp = doc.part.comments_part
-        if cp is None:
-            return {}
-        for cel in cp._element.iter(qn("w:comment")):
-            cid = cel.get(qn("w:id"))
-            if cid is None:
-                continue
-            texts = [t.text or "" for t in cel.iter(qn("w:t"))]
-            comment_map[cid] = "".join(texts).strip()
-    except Exception:
-        pass
-    return comment_map
-
-
-def _collect_image_link_annotations(doc):
-    """Find images annotated with a URL-only Word comment.
-
-    A "URL-only comment" is a Word comment whose entire text is a single
-    http/https URL.  Any image in the same paragraph as that comment range
-    is recorded along with the current module heading.
-
-    Returns [{"module": "Module 1: ...", "image": "image1.png",
-               "url": "https://..."}, ...]
-    """
-    comment_map = _extract_comments(doc)
-    url_comments = {cid: txt for cid, txt in comment_map.items()
-                    if _URL_RE.match(txt)}
-    if not url_comments:
-        return []
-
-    NS_BLIP = "http://schemas.openxmlformats.org/drawingml/2006/main"
-    NS_REL  = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-    MOD_RE  = re.compile(
-        r"Module\s+([1-9][0-9]?)\s*:(.+)", re.IGNORECASE | re.DOTALL)
-
-    results = []
-    current_module = "Document"
-    open_ids = set()
-
-    for el in doc.element.body:
-        local = el.tag.split("}")[-1] if "}" in el.tag else el.tag
-        if local != "p":
-            continue
-        # Track module from heading text
-        txt = "".join(t.text or "" for t in el.iter(qn("w:t"))).strip()
-        m = MOD_RE.match(txt)
-        if m:
-            current_module = "Module " + m.group(1) + ": " + m.group(2).strip()
-        # Open URL-comment ranges
-        for crs in el.findall(qn("w:commentRangeStart")):
-            cid = crs.get(qn("w:id"))
-            if cid in url_comments:
-                open_ids.add(cid)
-        # Record image + URL if any open ranges
-        if open_ids:
-            for drawing in el.iter(qn("w:drawing")):
-                for blip in drawing.iter(f"{{{NS_BLIP}}}blip"):
-                    rId = blip.get(f"{{{NS_REL}}}embed")
-                    if rId:
-                        try:
-                            fname = doc.part.rels[rId].target_part.filename
-                        except Exception:
-                            fname = rId
-                        for cid in sorted(open_ids):
-                            results.append({
-                                "module": current_module,
-                                "image":  fname,
-                                "url":    url_comments[cid],
-                            })
-        # Close comment ranges
-        for cre in el.findall(qn("w:commentRangeEnd")):
-            open_ids.discard(cre.get(qn("w:id")))
-
-    return results
-
-
-def _write_image_links_file(link_annotations, out_path):
-    """Write image link annotations to a plain-text file.
-    Returns True if anything was written.
-    """
-    if not link_annotations:
-        return False
-    lines = [
-        "Image Link Annotations",
-        "=" * 60,
-        "Generated by Word -> Brightspace Converter",
-        "",
-    ]
-    cur_mod = None
-    for entry in link_annotations:
-        mod = entry["module"]
-        if mod != cur_mod:
-            if cur_mod is not None:
-                lines.append("")
-            lines.append(f"[ {mod} ]")
-            cur_mod = mod
-        lines.append(f"  {entry['image']}")
-        lines.append(f"    {entry['url']}")
-    out_path.write_text("\n".join(lines), encoding="utf-8")
-    return True
-
-
 def convert_docx(docx_path, settings):
     """Convert *docx_path* to HTML.
 
-    Returns a tuple ``(body_html, image_map, log, link_annotations)`` where:
+    Returns a tuple ``(body_html, image_map, log)`` where:
     - *image_map* is ``{filename: bytes}`` of every extracted image
     - *log* is a list of ``{"level": "info"|"warn"|"error", "msg": str}`` dicts
-    - *link_annotations* is a list of {module, image, url} dicts
-      from URL-only comments attached to images
     """
-    hmap     = settings.get("heading_map", DEFAULT_HEADING_MAP)
-    ul_out   = settings.get("ul_transform", "ul")
-    ol_out   = settings.get("ol_transform", "ol")
-    bq_out   = settings.get("bq_transform", "blockquote")
-    bq_hr    = settings.get("bq_hr", False)
-    acc_head = settings.get("accordion_heading", ACCORDION_HEADING)
+    hmap        = settings.get("heading_map", DEFAULT_HEADING_MAP)
+    ul_out      = settings.get("ul_transform", "ul")
+    ol_out      = settings.get("ol_transform", "ol")
+    bq_out      = settings.get("bq_transform", "blockquote")
+    bq_hr       = settings.get("bq_hr", False)
+    acc_head    = settings.get("accordion_heading", ACCORDION_HEADING)
+    strip_style = settings.get("strip_style", True)
 
     log = []   # list of {"level": "info"|"warn"|"error", "msg": str}
 
@@ -985,8 +888,10 @@ def convert_docx(docx_path, settings):
     for sn, count in sorted(unknown_styles.items(), key=lambda x: -x[1]):
         _log("warn", f"Unrecognised style '{sn}' ({count}×) — converted as plain <p>")
 
-    link_annotations = _collect_image_link_annotations(doc)
-    return "\n".join(html_parts), image_collector, log, link_annotations
+    body = "\n".join(html_parts)
+    if strip_style:
+        body = re.sub(r' *style="[^"]*"', "", body)
+    return body, image_collector, log
 
 
 def _bq_tags(bq_out):
@@ -1042,11 +947,16 @@ def split_modules(body_html):
         return []
 
     modules = []
+
+    # Capture any content before the first Module heading as Module 0
+    pre = body_html[:matches[0].start()].strip()
+    if pre:
+        modules.append({"number": 0, "title": "Introduction", "html": pre})
+
     for i, m in enumerate(matches):
         start = m.start()
         end   = matches[i + 1].start() if i + 1 < len(matches) else len(body_html)
-        tag   = m.group(1)          # e.g. "h2"
-        title = re.sub(r"<[^>]+>", "", m.group(2)).strip()  # strip any inline tags
+        title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
         num   = int(m.group(3))
         chunk = body_html[start:end].strip()
         modules.append({"number": num, "title": title, "html": chunk})
@@ -1237,15 +1147,17 @@ class ConverterApp(tk.Tk):
         self.presets         = {}          # name → settings dict
         self.preset_var      = tk.StringVar(value="")
 
-        self.heading_vars  = {}
-        self.ul_var        = tk.StringVar(value="ul")
-        self.ol_var        = tk.StringVar(value="ol")
-        self.bq_var        = tk.StringVar(value="blockquote")
-        self.bq_hr_var     = tk.BooleanVar(value=False)
-        self.acc_head_var  = tk.StringVar(value=ACCORDION_HEADING)
-        self.full_html_var = tk.BooleanVar(value=False)
-        self.save_next_var = tk.BooleanVar(value=True)
-        self.preview_mode  = tk.StringVar(value="source")
+        self.heading_vars    = {}
+        self.ul_var          = tk.StringVar(value="ul")
+        self.ol_var          = tk.StringVar(value="ol")
+        self.bq_var          = tk.StringVar(value="blockquote")
+        self.bq_hr_var       = tk.BooleanVar(value=False)
+        self.acc_head_var    = tk.StringVar(value=ACCORDION_HEADING)
+        self.full_html_var   = tk.BooleanVar(value=False)
+        self.save_next_var   = tk.BooleanVar(value=True)
+        self.strip_style_var = tk.BooleanVar(value=True)
+        self.preview_mode    = tk.StringVar(value="source")
+        self._last_file_dir  = None
 
         # Module-split state
         self.split_modules_var  = tk.BooleanVar(value=True)
@@ -1344,17 +1256,20 @@ class ConverterApp(tk.Tk):
             rb = tk.Radiobutton(
                 pill, text=text, variable=self._mode, value=value,
                 bg=BG3, fg=FG2, font=FONT_B,
-                activebackground=ACCENT, activeforeground=FG,
+                activebackground=ACCENT, activeforeground="#ffffff",
                 selectcolor=ACCENT, indicatoron=False,
                 relief="flat", bd=0, padx=0, pady=7,
                 cursor="hand2",
                 command=self._on_mode_change)
             rb.pack(side=side, fill="x", expand=True)
+            def _sync(*_): rb.config(fg="#ffffff" if self._mode.get() == value else FG2)
+            self._mode.trace_add("write", lambda *_: _sync())
             return rb
 
-        _pill_btn("  Single File  ", "single", "left")
+        btn_single = _pill_btn("  Single File  ", "single", "left")
         tk.Frame(pill, bg=BORDER, width=1).pack(side="left", fill="y")
         _pill_btn("  Batch  ", "batch", "left")
+        btn_single.config(fg="#ffffff")
 
         # ── Two swappable inner frames ─────────────────────────
         self._single_frame = tk.Frame(p, bg=BG2)
@@ -1415,45 +1330,45 @@ class ConverterApp(tk.Tk):
         tk.Label(p, text="OUTPUT OPTIONS", font=("Segoe UI", 8, "bold"),
                  bg=BG2, fg=FG3).pack(anchor="w", pady=(0, 6))
 
-        def _dark_cb(text, var, tip_text):
-            f = tk.Frame(p, bg=BG2)
-            f.pack(fill="x", pady=2)
+        opts_container = tk.Frame(p, bg=BG3, highlightthickness=1,
+                                  highlightbackground=BORDER)
+        opts_container.pack(fill="x", pady=(0, 4))
+
+        def _dark_cb(text, var, tip_text, parent=opts_container):
+            f = tk.Frame(parent, bg=BG3)
+            f.pack(fill="x", padx=10, pady=3)
             cb = tk.Checkbutton(f, text=text, variable=var,
-                                bg=BG2, fg=FG, activebackground=BG2,
-                                activeforeground=FG, selectcolor=BG3,
+                                bg=BG3, fg=FG, activebackground=BG3,
+                                activeforeground=FG, selectcolor=BG2,
                                 font=FONT, bd=0, highlightthickness=0,
                                 cursor="hand2")
             cb.pack(anchor="w")
             tip(cb, tip_text)
             return cb
 
-        _dark_cb("Wrap in full HTML document", self.full_html_var,
-                 "Adds <!DOCTYPE html>, <html>, <head>, <body> tags.\n"
-                 "Useful for browser preview. Leave unchecked for a bare\n"
-                 "snippet to paste into Brightspace's HTML editor.")
         _dark_cb("Save output alongside source .docx", self.save_next_var,
                  "Saves MyDoc.html next to MyDoc.docx.\n"
                  "Uncheck to choose a custom save location each time.")
         _dark_cb("Split into one file per Module", self.split_modules_var,
-                 "When headings like 'Module 1:', 'Module 2:' … are detected,\n"
+                 "When headings like 'Module 1:', 'Module 2:' \u2026 are detected,\n"
                  "each module is saved as its own HTML file.\n"
-                 "(MyDoc_module_01.html, MyDoc_module_02.html, …)\n\n"
+                 "(MyDoc_module_01.html, MyDoc_module_02.html, \u2026)\n\n"
                  "The preview panel will show one module at a time\n"
                  "and let you navigate between them with arrow buttons.")
-
-        btn_convert = tk.Button(p, text="Convert  \u2192", font=FONT_B,
-                                bg=ACCENT, fg=FG, relief="flat", bd=0,
-                                padx=16, pady=10, cursor="hand2",
-                                activebackground=ACCENT2, activeforeground=FG,
-                                command=self._run_convert)
-        btn_convert.pack(fill="x", pady=(16, 4))
-        tip(btn_convert, "Convert the selected .docx and save the HTML output.")
-
+        _dark_cb('Strip inline style="" attributes', self.strip_style_var,
+                 'Removes style="..." attributes from every HTML element.\n'
+                 "Recommended for pasting into Brightspace's HTML editor \u2014\n"
+                 "inline styles from Word can conflict with D2L's own theme.")
+        tk.Frame(opts_container, bg=BORDER, height=1).pack(fill="x", padx=10, pady=(4, 0))
+        _dark_cb("Wrap in full HTML document", self.full_html_var,
+                 "Adds <!DOCTYPE html>, <html>, <head>, <body> tags.\n"
+                 "Useful for browser preview. Leave unchecked for a bare\n"
+                 "snippet to paste into Brightspace's HTML editor.")
         self.status_var = tk.StringVar(value="")
         self.status_lbl = tk.Label(p, textvariable=self.status_var,
                                    bg=BG2, fg=SUCCESS, font=FONT,
                                    wraplength=320, justify="left")
-        self.status_lbl.pack(anchor="w", pady=(4, 0))
+        self.status_lbl.pack(anchor="w", pady=(8, 0))
 
         # Module detection info (shown when modules are found)
         self.module_info_var = tk.StringVar(value="")
@@ -1462,20 +1377,12 @@ class ConverterApp(tk.Tk):
                                         wraplength=320, justify="left")
         self.module_info_lbl.pack(anchor="w", pady=(2, 0))
 
-        btn_preview = tk.Button(p, text="Refresh Preview", font=FONT,
-                                bg=BG3, fg=FG, relief="flat", bd=0,
-                                padx=10, pady=7, cursor="hand2",
-                                activebackground=BORDER, activeforeground=FG,
-                                command=self._refresh_preview)
-        btn_preview.pack(fill="x", pady=(14, 0))
-        tip(btn_preview, "Re-run the conversion and update the preview panel.")
-
         # ── Conversion Log ────────────────────────────────────
         self._log_expanded = tk.BooleanVar(value=False)
 
         log_header = tk.Frame(p, bg=BG2, cursor="hand2")
         log_header.pack(fill="x", pady=(14, 0))
-        self._log_arrow = tk.Label(log_header, text="▶", font=FONT_S,
+        self._log_arrow = tk.Label(log_header, text="\u25b6", font=FONT_S,
                                    bg=BG2, fg=FG3)
         self._log_arrow.pack(side="left")
         self._log_header_lbl = tk.Label(
@@ -1509,6 +1416,16 @@ class ConverterApp(tk.Tk):
         self._log_text.tag_configure("warn",  foreground=WARN)
         self._log_text.tag_configure("error", foreground=ERR)
         self._log_text.tag_configure("dim",   foreground=FG3)
+
+        # ── Convert button — below the log ────────────────
+        tk.Frame(p, bg=BORDER, height=1).pack(fill="x", pady=(10, 0))
+        btn_convert = tk.Button(p, text="Convert  \u2192", font=FONT_B,
+                                bg=ACCENT, fg=FG, relief="flat", bd=0,
+                                padx=16, pady=10, cursor="hand2",
+                                activebackground=ACCENT2, activeforeground=FG,
+                                command=self._run_convert)
+        btn_convert.pack(fill="x", pady=(6, 0))
+        tip(btn_convert, "Convert the selected .docx and save the HTML output.")
 
     # ── Batch inner frame ──────────────────────────────────────
 
@@ -1721,7 +1638,7 @@ class ConverterApp(tk.Tk):
 
             try:
                 settings               = self._collect_settings()
-                body_html, img_map, lg, _bl = convert_docx(
+                body_html, img_map, lg = convert_docx(
                     str(entry["path"]), settings)
                 css      = self.custom_css or DEFAULT_PREVIEW_CSS
                 src_path = entry["path"]
@@ -1859,6 +1776,7 @@ class ConverterApp(tk.Tk):
     def _pick_file(self):
         path = filedialog.askopenfilename(
             title="Select Word Document",
+            initialdir=self._last_file_dir or Path.home(),
             filetypes=[("Word Documents", "*.docx"), ("All files", "*.*")])
         if path:
             self._load_file(path)
@@ -1868,7 +1786,9 @@ class ConverterApp(tk.Tk):
             messagebox.showwarning("Wrong file type",
                                    "Please select a .docx Word document.")
             return
-        self.selected_file = path
+        self.selected_file  = path
+        self._last_file_dir = str(Path(path).parent)
+        self._save_config()
         if hasattr(self, "_d2l_title_var"):
             self._d2l_title_var.set(Path(path).stem)
         name = Path(path).name
@@ -1930,6 +1850,23 @@ class ConverterApp(tk.Tk):
         _icon_btn(pf, "Save…",   self._save_preset_dialog,   "Save current settings as a new preset or overwrite an existing one.", 1)
         _icon_btn(pf, "Rename…", self._rename_preset_dialog,  "Rename the selected preset.",                                          2)
         _icon_btn(pf, "Delete",  self._delete_preset,          "Delete the selected preset.",                                          3)
+
+        # Import / Export row
+        io_row = tk.Frame(inner, bg=BG2)
+        io_row.pack(fill="x", pady=(4, 8))
+        def _io_btn(text, cmd, tip_text):
+            b = tk.Button(io_row, text=text, font=FONT_S, bg=BG3, fg=FG,
+                          relief="flat", bd=0, padx=9, pady=4, cursor="hand2",
+                          activebackground=BORDER, activeforeground=FG,
+                          command=cmd)
+            b.pack(side="left", padx=(0, 6))
+            tip(b, tip_text)
+        _io_btn("Export profiles…", self._export_presets,
+                "Save all profiles to a .json file so you can share\n"
+                "them with colleagues or move them to another machine.")
+        _io_btn("Import profiles…", self._import_presets,
+                "Load profiles from a .json file exported by this app.\n"
+                "Imported profiles are merged with your existing ones.")
 
         # ── Headings ──────────────────────────────────────────
         self._sep(inner, "Heading Transform",
@@ -2271,6 +2208,53 @@ class ConverterApp(tk.Tk):
         self._refresh_preset_combo()
         self.status_var.set(f'\u274c  Preset "{name}" deleted.')
 
+    def _export_presets(self):
+        if not self.presets:
+            messagebox.showinfo("No profiles", "There are no profiles to export.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export profiles",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialfile="brightspace_profiles.json")
+        if not path:
+            return
+        try:
+            Path(path).write_text(
+                json.dumps(self.presets, indent=2), encoding="utf-8")
+            n = len(self.presets)
+            self.status_var.set(
+                f"\u2705  Exported {n} profile{'s' if n != 1 else ''} to "
+                f"{Path(path).name}")
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc))
+
+    def _import_presets(self):
+        path = filedialog.askopenfilename(
+            title="Import profiles",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("File does not contain a profiles dictionary.")
+            added = sum(
+                1 for k, v in data.items()
+                if isinstance(k, str) and isinstance(v, dict)
+                and not self.presets.__setitem__(k, v))
+            if added == 0:
+                messagebox.showwarning("Nothing imported",
+                                       "No valid profiles found in the file.")
+                return
+            self._save_presets_file()
+            self._refresh_preset_combo()
+            self.status_var.set(
+                f"\u2705  Imported {added} profile{'s' if added != 1 else ''} "
+                f"from {Path(path).name}")
+        except Exception as exc:
+            messagebox.showerror("Import failed", str(exc))
+
     def _save_presets_file(self):
         try:
             PRESETS_FILE.write_text(
@@ -2396,6 +2380,7 @@ class ConverterApp(tk.Tk):
 
         _mode_btn("Rendered", "rendered")
         _mode_btn("HTML Source", "source")
+        _mode_btn("Side by Side", "split")
 
         # Module navigation bar (hidden until modules are detected)
         self.mod_nav_frame = tk.Frame(bar, bg=BG2)
@@ -2459,30 +2444,15 @@ class ConverterApp(tk.Tk):
 
         self._search_visible = False
 
-        # Preview area — Text widget for source, Frame+scrollable for rendered
+        # ── Preview area ──────────────────────────────────────────────────
+        # preview_outer holds:
+#   - bs_chrome (D2L navbar) — always visible
+#   - single_container — shown in source / rendered mode
+#   - split_container  — shown in split mode
         self.preview_outer = tk.Frame(parent, bg=PRE_BG)
         self.preview_outer.pack(fill="both", expand=True)
 
-        # Source pane (Text widget)
-        self.source_frame = tk.Frame(self.preview_outer, bg=PRE_BG)
-        self.preview_text = tk.Text(
-            self.source_frame, font=("Cascadia Code", 9), wrap="none",
-            bg=PRE_BG, fg=PRE_FG,
-            insertbackground=FG, relief="flat", bd=0,
-            padx=12, pady=12,
-            selectbackground=ACCENT, selectforeground=FG)
-        vsb = ttk.Scrollbar(self.source_frame, orient="vertical",
-                            command=self.preview_text.yview)
-        hsb = ttk.Scrollbar(self.source_frame, orient="horizontal",
-                            command=self.preview_text.xview)
-        self.preview_text.configure(yscrollcommand=vsb.set,
-                                    xscrollcommand=hsb.set)
-        vsb.pack(side="right", fill="y")
-        hsb.pack(side="bottom", fill="x")
-        self.preview_text.pack(fill="both", expand=True)
-
-        # ── Brightspace chrome: dark top navbar ───────────────────────────
-        # Mimics the breadcrumb strip that appears above every D2L content page.
+        # ── D2L chrome: navbar + separator ────────────────────────────────
         D2L_NAV    = "#1a2632"
         D2L_NAV_FG = "#ffffff"
         D2L_SEP    = "#3a4a58"
@@ -2511,30 +2481,105 @@ class ConverterApp(tk.Tk):
 
         tk.Frame(self.preview_outer, bg=D2L_SEP, height=1).pack(fill="x")
 
-        # ── Rendered pane: grey shell + white content well ─────────────────
-        self.rendered_frame = tk.Frame(self.preview_outer, bg=D2L_SHELL)
+        # ── Single-pane container (source or rendered, not both) ──────────
+        self._single_container = tk.Frame(self.preview_outer, bg=PRE_BG)
+        self._single_container.pack(fill="both", expand=True)
 
+        # Source frame lives inside single_container
+        self.source_frame = tk.Frame(self._single_container, bg=PRE_BG)
+        self.preview_text = tk.Text(
+            self.source_frame, font=("Cascadia Code", 9), wrap="none",
+            bg=PRE_BG, fg=PRE_FG,
+            insertbackground=FG, relief="flat", bd=0,
+            padx=12, pady=12,
+            selectbackground=ACCENT, selectforeground=FG)
+        vsb = ttk.Scrollbar(self.source_frame, orient="vertical",
+                            command=self.preview_text.yview)
+        hsb = ttk.Scrollbar(self.source_frame, orient="horizontal",
+                            command=self.preview_text.xview)
+        self.preview_text.configure(yscrollcommand=vsb.set,
+                                    xscrollcommand=hsb.set)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        self.preview_text.pack(fill="both", expand=True)
+
+        # Rendered frame lives inside single_container
+        self.rendered_frame = tk.Frame(self._single_container, bg=D2L_SHELL)
         card_frame = tk.Frame(
             self.rendered_frame,
             bg="#ffffff",
             highlightbackground="#d0d0d0",
             highlightthickness=1,
         )
-        card_frame.pack(fill="both", expand=True, padx=28, pady=24)
-
+        card_frame.pack(fill="both", expand=True, padx=0, pady=0)
         self.rendered_text = tk.Text(
             card_frame, font=("Lato", 11), wrap="word",
             bg="#ffffff", fg="#212121",
             relief="flat", bd=0, padx=32, pady=28,
             spacing1=0, spacing2=0, spacing3=0,
             selectbackground="#b3d4f5", selectforeground="#212121",
-            cursor="arrow", state="disabled")
+            cursor="xterm", state="normal", insertwidth=0)
         rvsb = ttk.Scrollbar(card_frame, orient="vertical",
                              command=self.rendered_text.yview)
         self.rendered_text.configure(yscrollcommand=rvsb.set)
         rvsb.pack(side="right", fill="y")
         self.rendered_text.pack(fill="both", expand=True)
         self._configure_rendered_tags()
+        self.rendered_text.bind("<Key>", lambda e: "break")
+        self.rendered_text.bind("<Control-a>",
+            lambda e: (self.rendered_text.tag_add("sel", "1.0", "end"), "break"))
+        self.rendered_text.bind("<Control-c>", lambda e: None)
+
+        # ── Split-pane container (source LEFT, rendered RIGHT) ────────────
+        self._split_pane = tk.PanedWindow(
+            self.preview_outer, orient="horizontal",
+            bg=BORDER, sashwidth=5, sashrelief="flat", sashpad=0)
+        # Not packed until split mode is activated
+
+        # Left panel of split: its own source text widget
+        _sp_left = tk.Frame(self._split_pane, bg=PRE_BG)
+        self._split_pane.add(_sp_left, minsize=200, stretch="always")
+        self.split_source_text = tk.Text(
+            _sp_left, font=("Cascadia Code", 9), wrap="none",
+            bg=PRE_BG, fg=PRE_FG,
+            insertbackground=FG, relief="flat", bd=0,
+            padx=12, pady=12,
+            selectbackground=ACCENT, selectforeground=FG,
+            state="disabled")
+        _sp_vsb = ttk.Scrollbar(_sp_left, orient="vertical",
+                                command=self.split_source_text.yview)
+        _sp_hsb = ttk.Scrollbar(_sp_left, orient="horizontal",
+                                command=self.split_source_text.xview)
+        self.split_source_text.configure(yscrollcommand=_sp_vsb.set,
+                                         xscrollcommand=_sp_hsb.set)
+        _sp_vsb.pack(side="right", fill="y")
+        _sp_hsb.pack(side="bottom", fill="x")
+        self.split_source_text.pack(fill="both", expand=True)
+
+        # Right panel of split: its own rendered widget
+        _sp_right = tk.Frame(self._split_pane, bg=D2L_SHELL)
+        self._split_pane.add(_sp_right, minsize=200, stretch="always")
+        _sp_card = tk.Frame(
+            _sp_right, bg="#ffffff",
+            highlightbackground="#d0d0d0", highlightthickness=1)
+        _sp_card.pack(fill="both", expand=True, padx=0, pady=0)
+        self.split_rendered_text = tk.Text(
+            _sp_card, font=("Lato", 11), wrap="word",
+            bg="#ffffff", fg="#212121",
+            relief="flat", bd=0, padx=32, pady=28,
+            spacing1=0, spacing2=0, spacing3=0,
+            selectbackground="#b3d4f5", selectforeground="#212121",
+            cursor="xterm", state="normal", insertwidth=0)
+        _sp_rvsb = ttk.Scrollbar(_sp_card, orient="vertical",
+                                 command=self.split_rendered_text.yview)
+        self.split_rendered_text.configure(yscrollcommand=_sp_rvsb.set)
+        _sp_rvsb.pack(side="right", fill="y")
+        self.split_rendered_text.pack(fill="both", expand=True)
+        self._configure_rendered_tags(target=self.split_rendered_text)
+        self.split_rendered_text.bind("<Key>", lambda e: "break")
+        self.split_rendered_text.bind("<Control-a>",
+            lambda e: (self.split_rendered_text.tag_add("sel", "1.0", "end"), "break"))
+        self.split_rendered_text.bind("<Control-c>", lambda e: None)
 
         # Bottom bar
         bot = tk.Frame(parent, bg=BG2)
@@ -2549,6 +2594,17 @@ class ConverterApp(tk.Tk):
                                 command=self._open_in_browser)
         btn_browser.pack(side="right", padx=8, pady=4)
         tip(btn_browser, "Open the converted HTML in your default browser.")
+
+        self._zip_btn = tk.Button(bot,
+                                  text="Save as ZIP  📦",
+                                  font=FONT, bg=BG2, fg=FG2, relief="flat", bd=0,
+                                  padx=10, pady=6, cursor="hand2",
+                                  activebackground=BG3, activeforeground=FG,
+                                  command=self._save_zip)
+        self._zip_btn.pack(side="right", padx=8, pady=4)
+        tip(self._zip_btn,
+            "Export all HTML files and images to a single ZIP archive.\n"
+            "Ready to upload to Brightspace via zip import.")
 
         self._copy_btn = tk.Button(bot,
                                    text="Copy HTML  \U0001f4cb",
@@ -2571,7 +2627,7 @@ class ConverterApp(tk.Tk):
         self.bind_all("<Control-Shift-c>", lambda e: self._copy_html())
         self.bind_all("<Control-Shift-C>", lambda e: self._copy_html())
 
-    def _configure_rendered_tags(self):
+    def _configure_rendered_tags(self, target=None):
         """Set up Text widget tags styled to match a Brightspace content page.
 
         spacing1 = pixels above the first line of a tagged run
@@ -2579,7 +2635,7 @@ class ConverterApp(tk.Tk):
         Because newlines are always inserted untagged, these values apply
         only to content lines — no stacking or double-spacing.
         """
-        t = self.rendered_text
+        t = target if target is not None else self.rendered_text
 
         # ── Headings ──────────────────────────────────────────────────────
         t.tag_configure("h1", font=("Lato", 24, "bold"),
@@ -2602,7 +2658,7 @@ class ConverterApp(tk.Tk):
         # ── Lists ─────────────────────────────────────────────────────────
         t.tag_configure("li", font=("Lato", 11),
                         foreground="#212121", spacing1=2, spacing3=2,
-                        lmargin1=28, lmargin2=44)
+                        lmargin1=12, lmargin2=28)
 
         # ── Blockquote ────────────────────────────────────────────────────
         t.tag_configure("blockquote", font=("Lato", 11, "italic"),
@@ -2612,6 +2668,7 @@ class ConverterApp(tk.Tk):
         # ── Inline formatting ─────────────────────────────────────────────
         t.tag_configure("bold",          font=("Lato", 11, "bold"))
         t.tag_configure("italic",        font=("Lato", 11, "italic"))
+        t.tag_configure("bold_italic",   font=("Lato", 11, "bold italic"))
         t.tag_configure("underline",     font=("Lato", 11, "underline"))
         t.tag_configure("strikethrough", font=("Lato", 11),
                         overstrike=True, foreground="#757575")
@@ -2633,6 +2690,17 @@ class ConverterApp(tk.Tk):
         t.tag_configure("card_body",  font=("Lato", 11),
                         foreground="#212121", spacing1=1, spacing3=1,
                         lmargin1=20, lmargin2=20)
+
+        # ── Table ─────────────────────────────────────────────────────────
+        t.tag_configure("tbl_rule",   foreground="#bdbdbd",
+                        font=("Cascadia Code", 10), spacing1=0, spacing3=0)
+        t.tag_configure("tbl_th",     foreground="#212121",
+                        font=("Cascadia Code", 10, "bold"),
+                        background="#f5f5f5", spacing1=1, spacing3=1)
+        t.tag_configure("tbl_td",     foreground="#212121",
+                        font=("Cascadia Code", 10), spacing1=1, spacing3=1)
+        t.tag_configure("tbl_border", foreground="#bdbdbd",
+                        font=("Cascadia Code", 10))
 
     def _toggle_search(self):
         if self._search_visible:
@@ -2659,19 +2727,22 @@ class ConverterApp(tk.Tk):
         self._search_matches = []
         self._search_count_lbl.config(text="")
         # Return focus to preview
-        if self.preview_mode.get() == "source":
+        if self.preview_mode.get() in ("source", "split"):
             self.preview_text.focus_set()
         else:
             self.rendered_text.focus_set()
 
     def _active_text_widget(self):
-        """Return whichever Text widget is currently visible."""
-        if self.preview_mode.get() == "source":
+        """Return the primary text widget for search.
+        In split mode search targets the source pane.
+        """
+        if self.preview_mode.get() in ("source", "split"):
             return self.preview_text
         return self.rendered_text
 
     def _search_clear_highlights(self):
-        for tw in (self.preview_text, self.rendered_text):
+        for tw in (self.preview_text, self.rendered_text,
+                   self.split_source_text, self.split_rendered_text):
             tw.tag_remove("search_match",   "1.0", "end")
             tw.tag_remove("search_current", "1.0", "end")
 
@@ -2731,55 +2802,238 @@ class ConverterApp(tk.Tk):
         self._search_idx = (self._search_idx - 1) % len(self._search_matches)
         self._search_highlight_current()
 
-    def _render_html_to_text(self, body_html):
-        """Parse body_html and insert styled text into the rendered_text widget.
+    def _render_html_to_text(self, body_html, _target=None):
+        """Parse body_html and styled text into the rendered_text widget.
 
-        Key spacing rule: newline characters are always inserted without any
-        tag so that spacing1/spacing3 only applies to lines that carry actual
-        content — preventing double/triple spacing from stacked tag spacings.
+        Handles:
+        • Accordions: div.accordion / div.card / div.card-header /
+          div.collapse / div.card-body rendered with card_title / card_body tags.
+        • Two-pass table rendering with column-aligned box-drawing borders.
+        • Nested lists: per-depth lmargin so sub-items are visually indented.
+        • Combined inline formatting (bold+italic etc.) resolved simultaneously.
+        • Clickable hyperlinks via unique per-link Text tags.
+        • Text stays selectable (widget remains in normal state).
         """
         import html as html_lib
         import html.parser
 
-        t = self.rendered_text
+        t = _target if _target is not None else self.rendered_text
         t.config(state="normal")
         t.delete("1.0", "end")
 
+        # ── Pass 1: extract table data for column-width measurement ──────
+        class _TableExtractor(html.parser.HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.tables      = []
+                self._cur_tbl    = None
+                self._cur_row    = None
+                self._cell_buf   = []
+                self._cell_is_th = False
+                self._cell_depth = 0
+
+            def handle_starttag(self, tag, attrs):
+                if tag == "table":
+                    self._cur_tbl = []
+                elif tag == "tr" and self._cur_tbl is not None:
+                    self._cur_row = []
+                elif tag in ("th", "td") and self._cur_row is not None:
+                    self._cell_buf   = []
+                    self._cell_is_th = (tag == "th")
+                    self._cell_depth = 1
+                elif self._cell_depth > 0:
+                    self._cell_depth += 1
+
+            def handle_endtag(self, tag):
+                if tag == "table":
+                    if self._cur_tbl is not None:
+                        self.tables.append(self._cur_tbl)
+                    self._cur_tbl = None
+                elif tag == "tr" and self._cur_tbl is not None:
+                    if self._cur_row is not None:
+                        self._cur_tbl.append(self._cur_row)
+                    self._cur_row = None
+                elif tag in ("th", "td") and self._cell_depth == 1:
+                    text = html_lib.unescape("".join(self._cell_buf)).strip()
+                    if self._cur_row is not None:
+                        self._cur_row.append((text, self._cell_is_th))
+                    self._cell_depth = 0
+                elif self._cell_depth > 1:
+                    self._cell_depth -= 1
+
+            def handle_data(self, data):
+                if self._cell_depth >= 1:
+                    self._cell_buf.append(data)
+
+        ex = _TableExtractor()
+        ex.feed(body_html)
+        table_data = ex.tables
+        table_idx  = [0]
+
+        def _col_widths(rows):
+            if not rows:
+                return []
+            n = max(len(r) for r in rows)
+            w = [0] * n
+            for row in rows:
+                for ci, (txt, _) in enumerate(row):
+                    if ci < n:
+                        w[ci] = max(w[ci], len(txt))
+            return w
+
+        def _render_table(rows):
+            if not rows:
+                return
+            widths = _col_widths(rows)
+            if not widths:
+                return
+            def _rule(l, m, r, fill="─"):
+                return l + m.join(fill * (w + 2) for w in widths) + r
+            t.insert("end", "\n")
+            t.insert("end", _rule("┌", "┬", "┐"), ("tbl_rule",))
+            for row in rows:
+                is_hdr   = any(is_th for _, is_th in row)
+                cell_tag = "tbl_th" if is_hdr else "tbl_td"
+                t.insert("end", "\n")
+                t.insert("end", "│", ("tbl_border",))
+                for ci, w in enumerate(widths):
+                    txt, _ = row[ci] if ci < len(row) else ("", False)
+                    t.insert("end", f" {txt:<{w}} ", (cell_tag,))
+                    t.insert("end", "│", ("tbl_border",))
+                if is_hdr:
+                    t.insert("end", "\n")
+                    t.insert("end", _rule("├", "┼", "┤"), ("tbl_rule",))
+            t.insert("end", "\n")
+            t.insert("end", _rule("└", "┴", "┘"), ("tbl_rule",))
+            t.insert("end", "\n")
+
+        # ── Hyperlink counter ─────────────────────────────────────────────
+        link_counter = [0]
+        card_counter = [0]   # unique id per accordion card
+
+        # ── Pass 2: main render ───────────────────────────────────────────
         class _Parser(html.parser.HTMLParser):
             def __init__(self, widget):
                 super().__init__()
-                self.w          = widget
-                self.tag_stack  = []
-                self.list_stack = []   # stack of ("ul"|"ol", counter)
-                self.skip       = False
-                self._pending_nl = 0   # untagged newlines queued to insert
+                self.w                 = widget
+                self.tag_stack         = []
+                self.list_stack        = []
+                self.skip              = False
+                self._pending_nl       = 0
+                self._link_tag         = None
+                self._in_table         = False
+                self._in_accordion     = False
+                self._in_card_hdr      = False
+                self._in_card_body     = False
+                self._suppress_heading = False
+                self._cur_body_tag     = None
+                self._hdr_start        = None
 
             def _flush_nl(self):
-                """Emit any queued plain newlines before content."""
                 if self._pending_nl:
                     self.w.insert("end", "\n" * self._pending_nl)
                     self._pending_nl = 0
 
             def _nl(self, n=1):
-                """Queue n newlines (merged so tags never receive \n)."""
                 self._pending_nl = max(self._pending_nl, n)
 
             def _insert(self, text, *tags):
-                if self.skip or not text:
+                if self.skip or self._in_table or not text:
                     return
                 self._flush_nl()
                 self.w.insert("end", text, tags)
 
+            def _inline_tags(self):
+                cur       = self.tag_stack
+                bold      = "strong" in cur or "b" in cur
+                italic    = "em"     in cur or "i" in cur
+                underline = "u"      in cur
+                strike    = "del"    in cur or "s" in cur
+                in_link   = "a"      in cur
+                in_li     = "li"     in cur
+                in_bq     = "blockquote" in cur
+                in_hdr    = any(h in cur for h in ("h1","h2","h3","h4","h5","h6"))
+
+                tags = []
+                if in_hdr and not self._suppress_heading:
+                    tags.append(next(h for h in cur
+                                     if h in ("h1","h2","h3","h4","h5","h6")))
+                elif self._in_card_hdr:
+                    tags.append("card_title")
+                elif self._in_card_body:
+                    if self._cur_body_tag:
+                        tags.append(self._cur_body_tag)
+                    if in_li:
+                        depth = max(sum(1 for x in cur if x in ("ul","ol")), 1)
+                        tags.append(f"li_d{depth}")
+                    else:
+                        tags.append("card_body")
+                elif in_li:
+                    depth = max(sum(1 for x in cur if x in ("ul","ol")), 1)
+                    tags.append(f"li_d{depth}")
+                elif in_bq:
+                    tags.append("blockquote")
+                else:
+                    tags.append("p")
+
+                if bold and italic:
+                    tags.append("bold_italic")
+                elif bold:
+                    tags.append("bold")
+                elif italic:
+                    tags.append("italic")
+                if underline:
+                    tags.append("underline")
+                if strike:
+                    tags.append("strikethrough")
+                if in_link and self._link_tag:
+                    tags.append("link")
+                    tags.append(self._link_tag)
+                return tuple(tags) if tags else ("p",)
+
             def handle_starttag(self, tag, attrs):
                 self.tag_stack.append(tag)
                 attrs = dict(attrs)
+                cls   = attrs.get("class", "")
+
+                # ── Accordion divs ──────────────────────────────────────
+                if tag == "div":
+                    if cls == "accordion":
+                        self._in_accordion = True
+                        self._nl(1)
+                    elif cls == "card" and self._in_accordion:
+                        # New card: assign a unique elide tag for its body
+                        card_counter[0] += 1
+                        self._cur_body_tag = f"card_body_{card_counter[0]}"
+                        self.w.tag_configure(self._cur_body_tag, elide=True)
+                        self._flush_nl()
+                    elif cls == "card-header" and self._in_accordion:
+                        self._in_card_hdr      = True
+                        self._suppress_heading = True
+                        self._nl(1)
+                        self._flush_nl()
+                        self._hdr_start = self.w.index("end")
+                    elif cls in ("collapse", "card-body") and self._in_accordion:
+                        self._in_card_body = True
+                    return
+
+                # ── Table ───────────────────────────────────────────────
+                if tag == "table":
+                    self._in_table = True
+                    self._nl(1)
+                    self._flush_nl()
+                    idx = table_idx[0]
+                    if idx < len(table_data):
+                        _render_table(table_data[idx])
+                        table_idx[0] += 1
+                    return
+                if self._in_table:
+                    return
+
                 if tag in ("h1","h2","h3","h4","h5","h6"):
-                    # Extra blank line before headings (except at very start)
-                    idx = self.w.index("end-1c")
-                    if idx != "1.0":
-                        self._nl(2)
-                elif tag == "p":
-                    pass   # gap handled on </p>
+                    if not self._in_card_hdr:
+                        if self.w.index("end-1c") != "1.0":
+                            self._nl(2)
                 elif tag == "ul":
                     self.list_stack.append(("ul", [0]))
                     self._nl(1)
@@ -2788,17 +3042,44 @@ class ConverterApp(tk.Tk):
                     self._nl(1)
                 elif tag == "li":
                     self._flush_nl()
+                    depth = len(self.list_stack)
                     if self.list_stack:
                         kind, ctr = self.list_stack[-1]
                         ctr[0] += 1
-                        bullet = f"  {ctr[0]}. " if kind == "ol" else "  \u2022 "
-                        self.w.insert("end", bullet, ("li",))
+                        indent = "    " * (depth - 1)
+                        bullet = (f"{indent}  {ctr[0]}. "
+                                  if kind == "ol"
+                                  else f"{indent}  • ")
+                        lm1 = 12 + (depth - 1) * 20
+                        lm2 = 28 + (depth - 1) * 20
+                        if self._in_card_body:
+                            lm1 += 16
+                            lm2 += 16
+                        li_tag = f"li_d{depth}"
+                        self.w.tag_configure(li_tag,
+                            font=("Lato", 11), foreground="#212121",
+                            spacing1=2, spacing3=2,
+                            lmargin1=lm1, lmargin2=lm2)
+                        self.w.insert("end", bullet, (li_tag,))
+                elif tag == "a":
+                    href = attrs.get("href", "")
+                    link_counter[0] += 1
+                    ltag = f"link_{link_counter[0]}"
+                    self.w.tag_configure(ltag, foreground="#006fbf",
+                                         font=("Lato", 11, "underline"))
+                    self.w.tag_bind(ltag, "<Enter>",
+                                    lambda e: self.w.config(cursor="hand2"))
+                    self.w.tag_bind(ltag, "<Leave>",
+                                    lambda e: self.w.config(cursor="xterm"))
+                    self.w.tag_bind(ltag, "<Button-1>",
+                                    lambda e, u=href: webbrowser.open(u))
+                    self._link_tag = ltag
                 elif tag == "blockquote":
                     self._nl(1)
                 elif tag == "hr":
                     self._nl(1)
                     self._flush_nl()
-                    self.w.insert("end", "\u2500" * 40, ("hr",))
+                    self.w.insert("end", "─" * 40, ("hr",))
                     self._nl(1)
                 elif tag == "img":
                     src   = attrs.get("src", "")
@@ -2806,32 +3087,75 @@ class ConverterApp(tk.Tk):
                     label = alt or (Path(src).name if src else "image")
                     self._nl(1)
                     self._flush_nl()
-                    self.w.insert("end", f"  \U0001f5bc\ufe0f  [{label}]", ("img",))
+                    self.w.insert("end",
+                                  f"  🖼️  [{label}]", ("img",))
                     self._nl(1)
-                elif tag in ("table","thead","tbody","tr","th","td"):
-                    if tag == "tr":
-                        self._nl(1)
-                    elif tag == "td":
-                        self._flush_nl()
-                        self.w.insert("end", "  | ", ("p",))
-                    elif tag == "th":
-                        self._flush_nl()
-                        self.w.insert("end", "  | ", ("p","bold"))
-                elif tag in ("script","style","head"):
+                elif tag in ("script", "style", "head"):
                     self.skip = True
 
             def handle_endtag(self, tag):
-                if tag in ("script","style","head"):
+                if tag in ("script", "style", "head"):
                     self.skip = False
                 if self.tag_stack and self.tag_stack[-1] == tag:
                     self.tag_stack.pop()
-                if tag in ("h1","h2","h3","h4","h5","h6"):
+
+                if tag == "div":
+                    if self._in_card_hdr:
+                        self._in_card_hdr      = False
+                        self._suppress_heading = False
+                        self._flush_nl()
+                        # Prepend ▶ indicator before header text
+                        body_tag      = self._cur_body_tag
+                        indicator_tag = f"{body_tag}_ind"
+                        hdr_click_tag = f"{body_tag}_hdr"
+                        if self._hdr_start:
+                            self.w.insert(self._hdr_start, "▶ ",
+                                          ("card_title", indicator_tag))
+                            self._hdr_start = None
+                        self._nl(1)
+                        # Bind click-to-toggle on the header
+                        def _make_toggle(bt, it):
+                            def _toggle(e):
+                                hidden = self.w.tag_cget(bt, "elide")
+                                now_show = hidden in (True, "1", "true", 1, "")
+                                # empty string means elide not set yet; treat as hidden
+                                # Actually check: if elide was set True initially:
+                                is_hidden = str(hidden) in ("1", "True", "true")
+                                self.w.tag_configure(bt, elide=not is_hidden)
+                                arrow = "▼" if is_hidden else "▶"
+                                ranges = self.w.tag_ranges(it)
+                                if ranges:
+                                    self.w.delete(ranges[0], ranges[1])
+                                    self.w.insert(ranges[0], arrow + " ",
+                                                  ("card_title", it))
+                            return _toggle
+                        self.w.tag_configure(hdr_click_tag, cursor="hand2")
+                        hdr_end = self.w.index("end-1c")
+                        # tag the full header line (find line start)
+                        line_start = self.w.index(f"{hdr_end} linestart")
+                        self.w.tag_add(hdr_click_tag, line_start, hdr_end)
+                        self.w.tag_bind(hdr_click_tag, "<Button-1>",
+                                        _make_toggle(body_tag, indicator_tag))
+                    elif self._in_card_body:
+                        self._in_card_body = False
+                        self._nl(1)
+                    return
+
+                if tag == "table":
+                    self._in_table = False
+                    return
+                if self._in_table:
+                    return
+
+                if tag == "a":
+                    self._link_tag = None
+                elif tag in ("h1","h2","h3","h4","h5","h6"):
                     self._nl(1)
                 elif tag == "p":
                     self._nl(2)
                 elif tag == "li":
                     self._nl(1)
-                elif tag in ("ul","ol"):
+                elif tag in ("ul", "ol"):
                     if self.list_stack:
                         self.list_stack.pop()
                     self._nl(1)
@@ -2839,47 +3163,39 @@ class ConverterApp(tk.Tk):
                     self._nl(1)
 
             def handle_data(self, data):
-                if self.skip:
+                if self.skip or self._in_table:
                     return
-                text = html_lib.unescape(data)
-                # Strip leading/trailing newlines from raw HTML whitespace
-                text = text.strip("\n\r")
+                text = html_lib.unescape(data).strip("\n\r")
                 if not text:
                     return
-                cur = self.tag_stack
-                if any(h in cur for h in ("h1","h2","h3","h4","h5","h6")):
-                    htag = next(h for h in cur
-                                if h in ("h1","h2","h3","h4","h5","h6"))
-                    self._insert(text, htag)
-                elif "strong" in cur or "b" in cur:
-                    self._insert(text, "bold")
-                elif "em" in cur or "i" in cur:
-                    self._insert(text, "italic")
-                elif "a" in cur:
-                    self._insert(text, "link")
-                elif "blockquote" in cur:
-                    self._insert(text, "blockquote")
-                elif "li" in cur:
-                    self._insert(text, "li")
-                elif "td" in cur:
-                    self._insert(text, "p")
-                elif "th" in cur:
-                    self._insert(text, "p", "bold")
-                else:
-                    self._insert(text, "p")
+                self._insert(text, *self._inline_tags())
 
         _Parser(t).feed(body_html)
-        # Flush any trailing queued newlines, then lock
-        t.config(state="disabled")
+        # Widget stays in normal state so text remains selectable
+        # Mirror into the split-pane rendered widget if it exists
+        if hasattr(self, "split_rendered_text") and t is self.rendered_text:
+            self._render_html_to_text(body_html,
+                                      _target=self.split_rendered_text)
 
     def _show_pane(self, mode):
-        """Switch between source and rendered panes."""
-        if mode == "source":
-            self.rendered_frame.pack_forget()
-            self.source_frame.pack(fill="both", expand=True)
+        """Switch between source, rendered, and split panes.
+
+        single_container holds source_frame and rendered_frame and is
+        shown in source/rendered modes.  _split_pane has its own
+        independent source and rendered widgets and is shown in split mode.
+        """
+        if mode == "split":
+            self._single_container.pack_forget()
+            self._split_pane.pack(fill="both", expand=True)
         else:
+            self._split_pane.pack_forget()
+            self._single_container.pack(fill="both", expand=True)
             self.source_frame.pack_forget()
-            self.rendered_frame.pack(fill="both", expand=True)
+            self.rendered_frame.pack_forget()
+            if mode == "source":
+                self.source_frame.pack(fill="both", expand=True)
+            else:
+                self.rendered_frame.pack(fill="both", expand=True)
 
     # ── Module navigation ─────────────────────────────────────
 
@@ -2887,8 +3203,10 @@ class ConverterApp(tk.Tk):
         """Show/hide the module nav bar and update its label."""
         if self._modules and self.split_modules_var.get():
             total = len(self._modules)
-            mod   = self._modules[self._module_idx]
-            self._mod_label_var.set(f"Module {self._module_idx + 1} of {total}")
+            mod     = self._modules[self._module_idx]
+            mod_num = mod["number"]
+            n_named = sum(1 for m in self._modules if m["number"] > 0)
+            self._mod_label_var.set(f"Module {mod_num} of {n_named}")
             tip(self._mod_prev_btn, f"Previous module")
             tip(self._mod_next_btn, f"Next module")
             self._mod_prev_btn.config(
@@ -2900,9 +3218,10 @@ class ConverterApp(tk.Tk):
             # Pack nav bar left of the "Preview" label if not already shown
             if not self.mod_nav_frame.winfo_ismapped():
                 self.mod_nav_frame.pack(side="left", padx=(8, 0))
+            n_files = total
             self.module_info_var.set(
-                f"📦  {total} module{'s' if total != 1 else ''} detected "
-                f"— will save {total} separate file{'s' if total != 1 else ''}")
+                f"📦  {n_named} module{'s' if n_named != 1 else ''} detected "
+                f"— will save {n_files} file{'s' if n_files != 1 else ''}")
         else:
             self.mod_nav_frame.pack_forget()
             self._mod_label_var.set("")
@@ -2928,7 +3247,10 @@ class ConverterApp(tk.Tk):
         self._show_pane(mode)
         if mode == "source":
             self._set_preview(html)
-        else:
+        elif mode == "rendered":
+            self._render_html_to_text(html)
+        else:  # split
+            self._set_preview(html)
             self._render_html_to_text(html)
         if self._search_visible:
             self._search_run()
@@ -2967,6 +3289,7 @@ class ConverterApp(tk.Tk):
             "bq_transform":      self.bq_var.get(),
             "bq_hr":             self.bq_hr_var.get(),
             "accordion_heading": self.acc_head_var.get(),
+            "strip_style":       self.strip_style_var.get(),
         }
 
     def _refresh_preview(self, *_):
@@ -2974,7 +3297,7 @@ class ConverterApp(tk.Tk):
             return
         try:
             settings                   = self._collect_settings()
-            body_html, _imgs, log, _links = convert_docx(self.selected_file, settings)
+            body_html, _imgs, log      = convert_docx(self.selected_file, settings)
             self._update_log(log)
 
             # Detect modules and update navigation state
@@ -2997,7 +3320,10 @@ class ConverterApp(tk.Tk):
             self._show_pane(mode)
             if mode == "source":
                 self._set_preview(body_html)
-            else:
+            elif mode == "rendered":
+                self._render_html_to_text(body_html)
+            else:  # split
+                self._set_preview(body_html)
                 self._render_html_to_text(body_html)
         except Exception as exc:
             self._show_pane("source")
@@ -3007,10 +3333,11 @@ class ConverterApp(tk.Tk):
             self._search_run()
 
     def _set_preview(self, text):
-        self.preview_text.config(state="normal")
-        self.preview_text.delete("1.0", "end")
-        self.preview_text.insert("1.0", text)
-        self.preview_text.config(state="disabled")
+        for tw in (self.preview_text, self.split_source_text):
+            tw.config(state="normal")
+            tw.delete("1.0", "end")
+            tw.insert("1.0", text)
+            tw.config(state="disabled")
 
     def _open_in_browser(self):
         if not self.selected_file:
@@ -3018,7 +3345,7 @@ class ConverterApp(tk.Tk):
             return
         try:
             settings                  = self._collect_settings()
-            body_html, img_map, _log, _links = convert_docx(self.selected_file, settings)
+            body_html, img_map, _log  = convert_docx(self.selected_file, settings)
             css  = self.custom_css or DEFAULT_PREVIEW_CSS
             full = wrap_html(body_html,
                              title=Path(self.selected_file).stem,
@@ -3037,6 +3364,81 @@ class ConverterApp(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Error", str(exc))
 
+    def _save_zip(self):
+        """Export all converted HTML + images to a ZIP archive.
+
+        Mirrors what _run_convert writes to disk:
+          - Module-split documents  one HTML file per module
+          - Single document         one HTML file
+          - images/ subfolder       included when images are present
+
+        Everything is built in memory; nothing hits disk until the user
+        confirms a save path.
+        """
+        if not self.selected_file:
+            messagebox.showinfo("No file", "Please select a .docx file first.")
+            return
+        try:
+            settings              = self._collect_settings()
+            body_html, img_map, _ = convert_docx(self.selected_file, settings)
+            css      = self.custom_css or DEFAULT_PREVIEW_CSS
+            src_path = Path(self.selected_file)
+            stem     = src_path.stem
+
+            # Build in-memory file list: [(arc_name, bytes), ...]
+            entries = []
+
+            if self.split_modules_var.get():
+                modules = split_modules(body_html)
+            else:
+                modules = []
+
+            if modules:
+                for mod in modules:
+                    html = mod["html"]
+                    if self.full_html_var.get():
+                        html = wrap_html(html, title=mod["title"], css=css)
+                    arc_name = "{stem}_module_{num:02d}.html".format(
+                        stem=stem, num=mod["number"])
+                    entries.append((arc_name, html.encode("utf-8")))
+            else:
+                if self.full_html_var.get():
+                    output = wrap_html(body_html, title=stem, css=css)
+                else:
+                    output = body_html
+                entries.append((stem + ".html", output.encode("utf-8")))
+
+            for fname, blob in (img_map or {}).items():
+                entries.append(("images/" + fname, blob))
+
+            # Ask for save path
+            zip_path = filedialog.asksaveasfilename(
+                title="Save ZIP archive",
+                defaultextension=".zip",
+                filetypes=[("ZIP archives", "*.zip"), ("All files", "*.*")],
+                initialfile=stem + ".zip",
+                initialdir=self._last_file_dir or str(Path.home()))
+            if not zip_path:
+                return
+
+            import io
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for arc_name, data in entries:
+                    zf.writestr(arc_name, data)
+            Path(zip_path).write_bytes(buf.getvalue())
+
+            n_html   = sum(1 for n, _ in entries if n.endswith(".html"))
+            n_images = len(img_map or {})
+            parts = [str(n_html) + " HTML file" + ("s" if n_html != 1 else "")]
+            if n_images:
+                parts.append(str(n_images) + " image" + ("s" if n_images != 1 else ""))
+            self.status_var.set(
+                "✅  Saved " + Path(zip_path).name +
+                " (" + ", ".join(parts) + ")")
+        except Exception as exc:
+            messagebox.showerror("ZIP error", str(exc))
+
     def _copy_html(self):
         """Copy the current HTML snippet to the clipboard.
 
@@ -3052,7 +3454,7 @@ class ConverterApp(tk.Tk):
                 label = f"Module {self._module_idx + 1}"
             else:
                 settings    = self._collect_settings()
-                html, _, _l, _links = convert_docx(self.selected_file, settings)
+                html, _, _l = convert_docx(self.selected_file, settings)
                 label       = "HTML"
 
             self.clipboard_clear()
@@ -3073,7 +3475,7 @@ class ConverterApp(tk.Tk):
             return
         try:
             settings                    = self._collect_settings()
-            body_html, img_map, log, link_annotations = convert_docx(self.selected_file, settings)
+            body_html, img_map, log     = convert_docx(self.selected_file, settings)
             css      = self.custom_css or DEFAULT_PREVIEW_CSS
             src_path = Path(self.selected_file)
 
@@ -3129,11 +3531,6 @@ class ConverterApp(tk.Tk):
                 if n_imgs:
                     self._log_append("info",
                         f"Images written to {out_dir / 'images'}")
-                if link_annotations:
-                    lp = out_dir / f"{stem}_image_links.txt"
-                    if _write_image_links_file(link_annotations, lp):
-                        self._log_append("info",
-                            f"Image links saved to {lp.name}")
                 self._save_config()
                 short = ", ".join(saved[:3]) + (" …" if len(saved) > 3 else "")
                 self.status_var.set(
@@ -3169,11 +3566,6 @@ class ConverterApp(tk.Tk):
             if n_imgs:
                 self._log_append("info",
                     f"Images written to {out_path.parent / 'images'}")
-            if link_annotations:
-                lp = out_path.parent / f"{src_path.stem}_image_links.txt"
-                if _write_image_links_file(link_annotations, lp):
-                    self._log_append("info",
-                        f"Image links saved to {lp.name}")
             self._save_config()
             self.status_var.set(
                 f"✅  Saved: {out_path.name}{_img_note(n_imgs)}")
@@ -3195,8 +3587,10 @@ class ConverterApp(tk.Tk):
             "full_html":      self.full_html_var.get(),
             "save_next":      self.save_next_var.get(),
             "split_modules":  self.split_modules_var.get(),
+            "strip_style":    self.strip_style_var.get(),
             "css_path":       self.custom_css_path or "",
             "last_preset":    self.preset_var.get(),
+            "last_file_dir":  self._last_file_dir or "",
         }
         try:
             CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
@@ -3217,6 +3611,10 @@ class ConverterApp(tk.Tk):
             self.full_html_var.set(cfg.get("full_html", False))
             self.save_next_var.set(cfg.get("save_next", True))
             self.split_modules_var.set(cfg.get("split_modules", True))
+            self.strip_style_var.set(cfg.get("strip_style", True))
+            lfd = cfg.get("last_file_dir", "")
+            if lfd and Path(lfd).is_dir():
+                self._last_file_dir = lfd
             css_path = cfg.get("css_path", "")
             if css_path and Path(css_path).exists():
                 self.custom_css = Path(css_path).read_text(
