@@ -1,5 +1,5 @@
 """
-build.py — one-command build script for BrightspaceConverter.exe
+build.py — one-command build script for CourseFileConverter.exe
 
 Usage:
     python build.py           # standard build
@@ -20,8 +20,8 @@ from pathlib import Path
 # works correctly regardless of which folder you invoke it from.
 HERE = Path(__file__).resolve().parent
 
-APP_NAME    = "BrightspaceConverter"
-ENTRY_POINT = str(HERE / "converter.py")
+APP_NAME    = "CourseFileConverter"
+ENTRY_POINT = str(HERE / "course_file_converter.py")
 ICON        = None          # Set to e.g. "assets/icon.ico" if you have one
 
 # Extra PyInstaller flags you want baked in permanently
