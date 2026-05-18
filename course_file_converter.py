@@ -14,6 +14,12 @@ normal paragraphs that follow it (until the next H4 or end of cell) → card bod
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import json, re, tempfile, webbrowser, shutil, subprocess, sys, zipfile, threading
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    _REQUESTS_OK = True
+except ImportError:
+    _REQUESTS_OK = False
 from pathlib import Path
 
 
@@ -354,6 +360,132 @@ def _p_resolve_padlet_url(url):
     return url
 
 
+# ── Link metadata fetching ────────────────────────────────────────────────────
+
+_YT_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)([\w-]{11})")
+
+def _fetch_youtube_meta(url, api_key=None):
+    """Return dict with title, channel, duration_str, year (best-effort)."""
+    if not _REQUESTS_OK:
+        return {}
+    vid_m = _YT_RE.search(url)
+    if not vid_m:
+        return {}
+    vid_id = vid_m.group(1)
+    meta = {}
+    try:
+        r = requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": f"https://www.youtube.com/watch?v={vid_id}", "format": "json"},
+            timeout=8)
+        if r.status_code == 200:
+            d = r.json()
+            meta["title"]   = d.get("title", "")
+            meta["channel"] = d.get("author_name", "")
+    except Exception:
+        pass
+    if api_key:
+        try:
+            r2 = requests.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                params={"part": "contentDetails,snippet", "id": vid_id, "key": api_key},
+                timeout=8)
+            if r2.status_code == 200:
+                items = r2.json().get("items", [])
+                if items:
+                    snippet = items[0].get("snippet", {})
+                    details = items[0].get("contentDetails", {})
+                    meta["year"] = snippet.get("publishedAt", "")[:4]
+                    dur = details.get("duration", "")
+                    m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", dur)
+                    if m:
+                        h, mins, s = (int(x or 0) for x in m.groups())
+                        meta["duration"] = (f"{h}:{mins:02d}:{s:02d}" if h
+                                            else f"{mins}:{s:02d}")
+        except Exception:
+            pass
+    return meta
+
+
+def _fetch_page_meta(url):
+    """Return dict with title, site, author, year from Open Graph / meta tags."""
+    if not _REQUESTS_OK:
+        return {}
+    try:
+        import json as _json
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        if r.status_code != 200:
+            return {}
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        def og(prop):
+            tag = soup.find("meta", property=f"og:{prop}")
+            return tag["content"].strip() if tag and tag.get("content") else None
+
+        def meta_name(name):
+            tag = soup.find("meta", attrs={"name": name})
+            return tag["content"].strip() if tag and tag.get("content") else None
+
+        def json_ld(field):
+            for tag in soup.find_all("script", type="application/ld+json"):
+                try:
+                    data = _json.loads(tag.string or "")
+                    items = data if isinstance(data, list) else [data]
+                    for item in items:
+                        if field in item:
+                            v = item[field]
+                            return v.get("name") if isinstance(v, dict) else str(v)
+                        for sub in item.get("@graph", []):
+                            if field in sub:
+                                v = sub[field]
+                                return v.get("name") if isinstance(v, dict) else str(v)
+                except Exception:
+                    pass
+            return None
+
+        title  = og("title") or (
+            soup.title.string.split("|")[0].split("\u2013")[0].strip()
+            if soup.title else None)
+        site   = og("site_name") or json_ld("publisher")
+        author = meta_name("author") or json_ld("author")
+        mod    = (meta_name("article:modified_time") or json_ld("dateModified") or "")[:4]
+        pub    = (meta_name("article:published_time") or json_ld("datePublished") or "")[:4]
+        year   = mod or pub or None
+        if author and site and author.strip().lower() == site.strip().lower():
+            author = None
+        return {k: v for k, v in
+                {"title": title, "site": site, "author": author, "year": year}.items()
+                if v}
+    except Exception:
+        return {}
+
+
+def _p_format_resource_spans(url, meta, is_youtube):
+    """Return a list of _Span objects for a formatted citation."""
+    if is_youtube:
+        title    = meta.get("title", "") or url
+        channel  = meta.get("channel", "")
+        duration = meta.get("duration", "?:??")
+        year     = meta.get("year", "????")
+        suffix   = f" ({duration}) from {channel} ({year})."
+        return [_Span(text="Watch ", bold=True),
+                _Span(text=title, href=url),
+                _Span(text=suffix)]
+    else:
+        title  = meta.get("title", "") or url
+        site   = meta.get("site", "")
+        author = meta.get("author", "")
+        year   = meta.get("year", "n.d.")
+        parts  = []
+        if author: parts.append(f"by {author}")
+        if site:   parts.append(f"from {site}")
+        parts.append(f"({year}).")
+        return [_Span(text="Read ", bold=True),
+                _Span(text=title, href=url),
+                _Span(text=" " + " ".join(parts))]
+
+
 def _p_display_text_for_url(url):
     if "storage.googleapis.com" in url or "padlet-uploads" in url:
         path = url.split("?")[0]
@@ -432,13 +564,22 @@ def _p_collect_links(paras, attachment_urls):
     return links
 
 
-def _p_hoist_links(paras, links):
+def _p_hoist_links(paras, links, api_key=None, fetch_meta=False):
     if not links: return paras
     label_para = _Para()
     label_para.spans.append(_Span(text="Resources:", bold=True))
     url_paras = []
     for url in links:
         p = _Para()
+        is_attachment = ("storage.googleapis.com" in url or "padlet-uploads" in url)
+        is_youtube    = bool(_YT_RE.search(url))
+        if fetch_meta and not is_attachment and _REQUESTS_OK:
+            meta = (_fetch_youtube_meta(url, api_key=api_key)
+                    if is_youtube else _fetch_page_meta(url))
+            if meta.get("title"):
+                p.spans.extend(_p_format_resource_spans(url, meta, is_youtube))
+                url_paras.append(p)
+                continue
         display = _p_display_text_for_url(url)
         p.spans.append(_Span(text=display, href=url))
         url_paras.append(p)
@@ -449,7 +590,7 @@ def _p_extract_list_paras(paras):
     return [p for p in paras if p.list_type in ("ul","ol") and p.plain_text().strip()]
 
 
-def p_parse_markdown(md_path):
+def p_parse_markdown(md_path, api_key=None, fetch_meta=False):
     with open(md_path, encoding="utf-8") as f:
         raw = f.read()
 
@@ -488,15 +629,15 @@ def p_parse_markdown(md_path):
         if kind == "course_obj":
             result["course_objectives"] = _p_extract_list_paras(paras)
         elif kind == "course_culm":
-            paras = _p_hoist_links(paras, links)
+            paras = _p_hoist_links(paras, links, api_key=api_key, fetch_meta=fetch_meta)
             result["course_culminating"] = {"title":clean,"paras":paras}
         elif kind == "mod_obj" and current_module is not None:
             current_module["objectives"] = _p_extract_list_paras(paras)
         elif kind == "mod_culm" and current_module is not None:
-            paras = _p_hoist_links(paras, links)
+            paras = _p_hoist_links(paras, links, api_key=api_key, fetch_meta=fetch_meta)
             current_module["module_culminating"] = {"title":clean,"paras":paras}
         elif kind in ("task","task_intro") and current_module is not None:
-            paras = _p_hoist_links(paras, links)
+            paras = _p_hoist_links(paras, links, api_key=api_key, fetch_meta=fetch_meta)
             current_module["tasks"].append({"title":clean,"paras":paras,"is_intro":kind=="task_intro"})
         elif current_module is None and kind not in ("course_obj","course_culm"):
             warnings.append(f"Card '{h3_raw[:60]}' appears before any module heading — skipped.")
@@ -983,9 +1124,10 @@ def p_execute_operations(doc, ops, warnings):
                 except Exception: pass
 
 
-def p_populate_word_template(markdown_file, template_file, output_file):
+def p_populate_word_template(markdown_file, template_file, output_file,
+                             api_key=None, fetch_meta=False):
     """Top-level entry point: convert and save. Returns list of warning strings."""
-    parsed, warnings = p_parse_markdown(markdown_file)
+    parsed, warnings = p_parse_markdown(markdown_file, api_key=api_key, fetch_meta=fetch_meta)
     doc   = Document(template_file)
     paras = list(doc.paragraphs)
     ops = p_plan_operations(parsed, paras, warnings)
@@ -1623,6 +1765,7 @@ class ConverterApp(tk.Tk):
         self._last_file_dir  = None
 
         self._p_preview_mode = tk.StringVar(value="rendered")  # Padlet tab preview mode
+        self._youtube_api_key = ""
         self._p_last_md_path    = None
         self._p_last_docx_path  = None
 
@@ -1689,10 +1832,15 @@ class ConverterApp(tk.Tk):
                               sashwidth=6, sashrelief="flat", sashpad=0)
         pane.pack(fill="both", expand=True)
 
-        left = tk.Frame(pane, bg=BG2, width=380); left.pack_propagate(False)
-        pane.add(left, minsize=320)
+        # nb_frame and right_pane are permanent pane children — never reparented
+        nb_frame = tk.Frame(pane, bg=BG2, width=380)
+        nb_frame.pack_propagate(False)
+        pane.add(nb_frame, minsize=320)
 
-        self.nb = ttk.Notebook(left)
+        self._right_pane = tk.Frame(pane, bg=BG)
+        pane.add(self._right_pane, minsize=380)
+
+        self.nb = ttk.Notebook(nb_frame)
         self.nb.pack(fill="both", expand=True)
 
         tc = tk.Frame(self.nb, bg=BG2, padx=PAD, pady=PAD)
@@ -1707,29 +1855,33 @@ class ConverterApp(tk.Tk):
         self._build_padlet_tab(tp)   # ← new
         self._build_settings_tab(ts)
 
-        right = tk.Frame(pane, bg=BG)
-        pane.add(right, minsize=380)
-
-        # Both preview panels live in the same right frame; tab-change swaps them
-        self._word_preview_frame   = tk.Frame(right, bg=BG)
-        self._padlet_preview_frame = tk.Frame(right, bg=BG)
+        # Both preview panels live in the right pane; tab-change swaps them
+        self._word_preview_frame   = tk.Frame(self._right_pane, bg=BG)
+        self._padlet_preview_frame = tk.Frame(self._right_pane, bg=BG)
         self._word_preview_frame.pack(fill="both", expand=True)   # visible by default
 
         self._build_preview_panel(self._word_preview_frame)
         self._build_padlet_preview(self._padlet_preview_frame)
 
-        # Swap right panel when the user switches tabs
         def _on_tab_change(event=None):
             idx = self.nb.index(self.nb.select())
-            if idx == 2:   # Settings tab — hide all previews
+            if idx == 2:   # Settings — collapse right pane to 0 width
                 self._word_preview_frame.pack_forget()
                 self._padlet_preview_frame.pack_forget()
-            elif idx == 1:   # Padlet → Word tab
-                self._word_preview_frame.pack_forget()
-                self._padlet_preview_frame.pack(fill="both", expand=True)
-            else:            # Word to Brightspace tab
-                self._padlet_preview_frame.pack_forget()
-                self._word_preview_frame.pack(fill="both", expand=True)
+                pane.paneconfigure(self._right_pane, minsize=0, width=0)
+                # Move sash all the way right so nb_frame fills the window
+                self.after(1, lambda: pane.sash_place(0, 99999, 0))
+            else:
+                pane.paneconfigure(self._right_pane, minsize=380)
+                # Restore sash to a sensible split position
+                self.after(1, lambda: pane.sash_place(0, 420, 0))
+                if idx == 1:   # Padlet -> Word tab
+                    self._word_preview_frame.pack_forget()
+                    self._padlet_preview_frame.pack(fill="both", expand=True)
+                else:          # Word to Brightspace tab
+                    self._padlet_preview_frame.pack_forget()
+                    self._word_preview_frame.pack(fill="both", expand=True)
+
         self.nb.bind("<<NotebookTabChanged>>", _on_tab_change)
 
     # ════════════════════════════════════════════════════════
@@ -1899,7 +2051,10 @@ class ConverterApp(tk.Tk):
 
         def worker():
             try:
-                warns = p_populate_word_template(md, tmpl, out)
+                warns = p_populate_word_template(
+                    md, tmpl, out,
+                    api_key=self._youtube_api_key or None,
+                    fetch_meta=bool(self._youtube_api_key))
                 self.after(0, self._p_on_success, out, warns)
             except Exception:
                 import traceback
@@ -2799,6 +2954,60 @@ class ConverterApp(tk.Tk):
             "Format: \u201cCONT806: The Learning Environment\u201d \u2014 the course code is "
             "extracted and moved to the front, followed by the descriptive title. "
             "Replaces the current placeholder \u201cCONT###:\u201d heading in the template.")
+
+        # ── Resource Metadata / YouTube API Key ───────────
+        self._sep(inner, "Resource Metadata",
+                  "Automatically fetch titles, authors, and publication dates for "
+                  "linked resources when converting a Padlet document.")
+        tk.Label(inner,
+                 text="When a YouTube API key is saved, Watch and Read citations are "
+                      "generated automatically for video and web links during conversion.",
+                 font=FONT_S, bg=BG2, fg=FG2, wraplength=480, justify="left"
+                 ).pack(anchor="w", pady=(0, 8))
+
+        api_row = tk.Frame(inner, bg=BG2); api_row.pack(fill="x", pady=(0, 4))
+        tk.Label(api_row, text="YouTube API Key", font=FONT, bg=BG2, fg=FG,
+                 width=18, anchor="w").pack(side="left")
+        self._yt_key_var = tk.StringVar(value=self._youtube_api_key)
+        _key_entry = tk.Entry(api_row, textvariable=self._yt_key_var,
+                              show="•", font=FONT,
+                              bg=BG3, fg=FG, insertbackground=FG,
+                              relief="flat", bd=4, width=32)
+        _key_entry.pack(side="left", padx=(0, 6))
+        tip(_key_entry,
+            "Your YouTube Data API v3 key. Stored locally in your config file "
+            "and never transmitted anywhere except the YouTube API.\n\n"
+            "When present: Watch citations include title, channel, run-time, and year. "
+            "Read citations for non-YouTube links include title, author, site name, "
+            "and year of last modification.\n\nLeave blank to disable.")
+        _show_var = tk.BooleanVar(value=False)
+        def _toggle_show():
+            _key_entry.config(show="" if _show_var.get() else "•")
+        tk.Checkbutton(api_row, text="Show", variable=_show_var, command=_toggle_show,
+                       bg=BG2, fg=FG2, activebackground=BG2, activeforeground=FG,
+                       selectcolor=BG3, font=FONT_S, bd=0,
+                       highlightthickness=0).pack(side="left", padx=(0, 8))
+        _api_status = tk.Label(inner, text="", font=FONT_S, bg=BG2, fg=FG3)
+        _api_status.pack(anchor="w", pady=(0, 6))
+        def _save_api_key():
+            key = self._yt_key_var.get().strip()
+            self._youtube_api_key = key
+            self._save_config()
+            if key:
+                _api_status.config(
+                    text="✅  Key saved. Metadata will be fetched on next conversion.",
+                    fg=SUCCESS)
+            else:
+                _api_status.config(text="Key cleared. Metadata fetching disabled.", fg=FG3)
+        tk.Button(inner, text="Save Key", font=FONT,
+                  bg=ACCENT, fg="#fff", relief="flat", bd=0,
+                  padx=12, pady=4, cursor="hand2",
+                  activebackground=ACCENT2, activeforeground="#fff",
+                  command=_save_api_key).pack(anchor="w", pady=(0, 4))
+        if self._youtube_api_key:
+            _api_status.config(
+                text="✅  Key saved. Metadata will be fetched on next conversion.",
+                fg=SUCCESS)
 
     # ── Preset management ─────────────────────────────────────
 
@@ -3740,7 +3949,8 @@ class ConverterApp(tk.Tk):
                "full_html":self.full_html_var.get(),"save_next":self.save_next_var.get(),
                "split_modules":self.split_modules_var.get(),"strip_style":self.strip_style_var.get(),
                "para_font_size":self.para_font_size.get(),"css_path":self.custom_css_path or "",
-               "last_preset":self.preset_var.get(),"last_file_dir":self._last_file_dir or ""}
+               "last_preset":self.preset_var.get(),"last_file_dir":self._last_file_dir or "",
+               "youtube_api_key":self._youtube_api_key}
         try: CONFIG_FILE.write_text(json.dumps(cfg,indent=2), encoding="utf-8")
         except Exception: pass
 
@@ -3765,6 +3975,7 @@ class ConverterApp(tk.Tk):
                 self.custom_css_path=css_path
                 self.css_label.config(text=f"✅  {Path(css_path).name}", fg=SUCCESS)
             self._last_preset_name=cfg.get("last_preset","")
+            self._youtube_api_key=cfg.get("youtube_api_key","")
         except Exception: self._last_preset_name=""
 
 
